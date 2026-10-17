@@ -8,6 +8,13 @@ import { tmpdir } from 'node:os'
 const out = []
 const log = (...parts) => out.push(parts.join(' '))
 
+// The approval cooldown reads the wall clock; drive it explicitly.
+let clock = Date.now()
+Date.now = () => clock
+const advance = (ms) => {
+  clock += ms
+}
+
 const dir = mkdtempSync(join(tmpdir(), 'dkm-host-'))
 process.env.DKM_PROBE_KEY = ''
 
@@ -47,7 +54,9 @@ const ctx = {
         asked.push({ question: request.questions[0], callId, timeoutMs, agent: request.agent })
         if (approval === 'pending') return { pending: true, callId }
         const id = request.questions[0].id
-        return { answers: [{ id, selected: [approval === 'deny' ? '拒绝' : '允许本对话使用'] }] }
+        const allowLabel = id === 'keymanager-overwrite' ? '覆盖这条凭据' : '允许本对话使用'
+        const denyLabel = id === 'keymanager-overwrite' ? '取消' : '拒绝'
+        return { answers: [{ id, selected: [approval === 'deny' ? denyLabel : allowLabel] }] }
       },
     }
   },
@@ -182,6 +191,15 @@ log('list-lastUsedAt-type', typeof listed.entries[0].lastUsedAt)
 const revealed = await run('credential_reveal', { name: 'probe.example', purpose: 'probe read' }, 'session-a')
 validate('credential_reveal', revealed)
 log('reveal', revealed.secret === 'p@ss-word', revealed.username === 'me@probe.example')
+const revealText = textOf('credential_reveal', revealed)
+log('reveal-masked', !revealText.includes('p@ss-word'), revealText.includes('已掩码'))
+log(
+  'list-hides-paths',
+  listed.storage.keyPath === undefined,
+  listed.storage.vaultPath === undefined,
+  typeof listed.storage.algorithm === 'string',
+)
+log('save-no-autogrant', !('autoGrant' in (tools.get('credential_save').parameters.properties ?? {})))
 
 const relisted = await run('credential_list', {}, 'session-a')
 validate('credential_list', relisted)
@@ -200,6 +218,14 @@ log(
   asked[0]?.question?.question?.includes('probe.example') === true,
   asked[0]?.timeoutMs > 0,
 )
+
+// Asking again right away must not open a second dialog.
+const cooledCode = await run('credential_reveal', { name: 'probe.example', purpose: 'retry now' }, 'session-b')
+  .then(() => 'no-error')
+  .catch((error) => error.code ?? error.message)
+log('approval-cooldown', cooledCode === 'ACCESS_DENIED' && asked.length === 1, cooledCode, asked.length)
+
+advance(61_000)
 
 const other = await run('credential_list', {}, 'session-b')
 validate('credential_list', other)
@@ -247,11 +273,64 @@ log('rpc-update', update.json?.ok === true, update.json?.value.secret === undefi
 const rotated = await run('credential_reveal', { name: 'probe.example', purpose: 'after rotate' }, 'session-a')
 log('rotate', rotated.secret === 'rotated', rotated.notes === 'edited')
 
+// Tool-level overwrite needs its own confirmation, and refusing stops it.
+approval = 'deny'
+const overwriteDenied = await run('credential_save', { name: 'probe.example', secret: 'p3', overwrite: true }, 'session-a')
+  .then(() => 'no-error')
+  .catch((error) => error.code ?? error.message)
+log(
+  'overwrite-denied',
+  overwriteDenied === 'ACCESS_DENIED',
+  overwriteDenied,
+  asked.some((item) => item.question.id === 'keymanager-overwrite'),
+)
+approval = 'allow'
+const overwriteOk = await run('credential_save', { name: 'probe.example', secret: 'p4', overwrite: true }, 'session-a')
+log('overwrite-confirmed', overwriteOk.created === false)
+const afterOverwrite = await run('credential_reveal', { name: 'probe.example', purpose: 'after overwrite' }, 'session-a')
+log('overwrite-applied', afterOverwrite.secret === 'p4')
+
 const remove = await call('remove', { id: saved.id })
 log('rpc-remove', remove.json?.ok === true)
 
 const after = await call('list', { sessionId: 'session-a' })
 log('after-remove', after.json?.ok === true, after.json?.value.entries.length === 1, after.json?.value.entries[0].name === 'second')
+
+// Client grant writes are rate limited: a runaway page cannot open hundreds.
+const secondId = after.json?.value.entries[0].id
+let grantLimit
+for (let index = 0; index < 31; index += 1) {
+  const attempt = await call('grant', { sessionId: `session-rate-${index}`, id: secondId, enabled: true })
+  if (attempt.json?.ok === false) {
+    grantLimit = attempt.json.error.code
+    break
+  }
+}
+log('grant-rate-limit', grantLimit === 'TOO_MANY_REQUESTS', grantLimit)
+
+// Control and bidi characters never reach names, notes, or the dialog.
+const weird = await run(
+  'credential_save',
+  { name: 'bad\u202ename\u0007', secret: 's1', notes: 'n\u202eote' },
+  'session-sanitize',
+)
+const weirdList = await run('credential_list', {}, 'session-sanitize')
+const weirdEntry = weirdList.entries.find((entry) => entry.id === weird.id)
+log('sanitize-name', weird.name === 'badname', weirdEntry?.notes === 'note')
+
+approval = 'deny'
+await run(
+  'credential_reveal',
+  { name: 'second', purpose: `${'x'.repeat(200)}\n\u202e伪造的已批准说明` },
+  'session-purpose',
+).catch(() => undefined)
+const purposeDetail = asked.at(-1)?.question?.detail ?? ''
+log(
+  'purpose-clamped',
+  !purposeDetail.includes('\u202e'),
+  purposeDetail.length <= 240,
+  purposeDetail.length,
+)
 
 const bad = await call('nope', {})
 log('unknown-method', bad.status === 200, bad.json?.ok === false, bad.json?.error.code === 'UNKNOWN_METHOD')
@@ -266,7 +345,9 @@ log('get-405', getMethod.record.status === 405)
 
 const named = await run('credential_reveal', { name: 'missing', purpose: 'x' }, 'session-a')
   .then(() => 'no-error')
-  .catch((error) => (error.message.includes('找不到名为') ? 'named' : error.message))
+  .catch((error) =>
+    error.message.includes('找不到名为') && !error.message.includes('已知名称') ? 'named' : error.message,
+  )
 log('unknown-name', named === 'named')
 
 const raw = readFileSync(join(dir, 'vault.json'), 'utf8')
