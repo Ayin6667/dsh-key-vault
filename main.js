@@ -299,7 +299,13 @@ function renderListing(value) {
   for (const entry of value.entries) {
     const facts = [KIND_LABELS[entry.kind] ?? entry.kind]
     if (entry.username.length > 0) facts.push(`用户名 ${entry.username}`)
-    facts.push(entry.available ? '本对话可读' : '本对话未开放（可向用户申请）')
+    facts.push(
+      entry.available
+        ? '本对话可读'
+        : entry.redacted
+          ? '本对话未开放（备注与账号已隐藏，可向用户申请）'
+          : '本对话未开放（可向用户申请）',
+    )
     if (entry.autoGrant) facts.push('所有对话可读')
     if (entry.useCount > 0) facts.push(`已读取 ${entry.useCount} 次`)
     lines.push(`- ${entry.name}［${facts.join('，')}］`)
@@ -325,6 +331,7 @@ const entryViewSchema = {
     lastUsedAt: { type: 'string' },
     createdAt: { type: 'string' },
     updatedAt: { type: 'string' },
+    redacted: { type: 'boolean' },
   },
 }
 
@@ -432,11 +439,21 @@ export function apply(ctx, config = {}) {
           // The tool output schema is strings only: fold absent values into ''.
           // File paths stay out of model-visible output on purpose: they would
           // hand the model the exact location of the vault and its master key.
+          // Metadata of an entry this conversation may not read is itself
+          // sensitive (notes say where the secret is used), so it is blanked.
+          const entries = value.entries.map((entry) => ({
+            ...entry,
+            lastUsedAt: entry.lastUsedAt ?? '',
+            ...(entry.available ? {} : { username: '', notes: '', redacted: true }),
+          }))
+          const readable = new Set(entries.filter((entry) => entry.available).map((entry) => entry.id))
           return {
             ...value,
             sessionId: value.sessionId ?? '',
             storage: { algorithm: value.storage.algorithm },
-            entries: value.entries.map((entry) => ({ ...entry, lastUsedAt: entry.lastUsedAt ?? '' })),
+            entries,
+            // Audit rows carry purpose text and other sessions' ids: same rule.
+            usage: value.usage.filter((row) => readable.has(row.entryId)),
           }
         },
       }),
