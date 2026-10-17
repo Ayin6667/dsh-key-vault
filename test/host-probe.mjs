@@ -230,6 +230,15 @@ advance(61_000)
 const other = await run('credential_list', {}, 'session-b')
 validate('credential_list', other)
 log('list-other', other.entries[0].available === false, other.availableCount === 0)
+log(
+  'list-redacted',
+  other.entries[0].notes === '',
+  other.entries[0].username === '',
+  other.entries[0].redacted === true,
+  other.usage.length === 0,
+)
+const otherText = textOf('credential_list', other)
+log('render-redacted', otherText.includes('已隐藏'), !otherText.includes('probe note'))
 
 // The user approves: the secret comes back and the grant is remembered.
 approval = 'allow'
