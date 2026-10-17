@@ -11,7 +11,7 @@
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { appendFile, mkdir, stat, truncate } from 'node:fs/promises'
-import { KeyVault, VaultError, credentialName } from './core.js'
+import { KeyVault, VaultError, credentialName, stripUnsafe } from './core.js'
 
 /** Stable Loader identity. */
 const RPC_PATH = '/keymanager/rpc'
@@ -46,7 +46,7 @@ function createDiagnostics(dir) {
         await mkdir(dir, { recursive: true })
         const info = await stat(file).catch(() => undefined)
         if (info !== undefined && info.size > DIAG_MAX_BYTES) await truncate(file, 0)
-        await appendFile(file, `${new Date().toISOString()} ${line}\n`)
+        await appendFile(file, `${new Date().toISOString()} ${line}\n`, { mode: 0o600 })
       } catch {
         /* diagnostics must never break a call */
       }
@@ -63,6 +63,14 @@ const APPROVAL_TIMEOUT_MS = 120_000
 const ALLOW_LABEL = '允许本对话使用'
 const DENY_LABEL = '拒绝'
 
+/** One conversation may ask about the same entry once per minute at most. */
+const REQUEST_COOLDOWN_MS = 60_000
+
+/** Purpose text shown in the approval dialog: single line, bounded. */
+function dialogPurpose(value) {
+  return stripUnsafe(value).replace(/\s+/g, ' ').trim().slice(0, 120)
+}
+
 /**
  * Ask the user, inside the conversation, whether this session may read one
  * entry. Returns 'allowed' | 'denied' | 'timeout' | 'unavailable'; only the
@@ -71,11 +79,15 @@ const DENY_LABEL = '拒绝'
 async function requestAccess({ userQuestions, agent, callId, signal, entry, purpose }) {
   if (userQuestions === undefined || typeof userQuestions.askTimed !== 'function') return 'unavailable'
   if (agent === undefined || callId === undefined) return 'unavailable'
+  // The entry's own notes come from the user; the model's purpose is only an
+  // annotation, never the primary line of the dialog.
+  const trusted = entry.notes.length > 0 ? `凭据备注：${dialogPurpose(entry.notes)}` : ''
+  const stated = purpose.length > 0 ? `Agent 说明的用途（模型自述，仅供参考）：${purpose}` : 'Agent 没有说明用途。'
   const question = {
     id: 'keymanager-access',
     header: '凭据访问申请',
     question: `允许本对话读取凭据「${entry.name}」吗？`,
-    detail: purpose.length > 0 ? `Agent 说明的用途：${purpose}` : 'Agent 没有说明用途。',
+    detail: [trusted, stated].filter((line) => line.length > 0).join('\n'),
     options: [
       { label: ALLOW_LABEL, description: '本对话内可反复读取，应用重启后失效。' },
       { label: DENY_LABEL, description: '不开放，Agent 拿不到这条密钥。' },
@@ -95,6 +107,43 @@ async function requestAccess({ userQuestions, agent, callId, signal, entry, purp
   if (result.pending === true) return 'timeout'
   const selected = result.answers?.[0]?.selected?.[0] ?? ''
   return selected === ALLOW_LABEL ? 'allowed' : 'denied'
+}
+
+const OVERWRITE_LABEL = '覆盖这条凭据'
+const CANCEL_LABEL = '取消'
+
+/**
+ * Overwriting an existing entry destroys the old secret, so it takes the same
+ * in-conversation confirmation as reading one. The tool parameter alone is
+ * never enough: the model cannot consent on the user's behalf.
+ */
+async function confirmOverwrite({ userQuestions, agent, callId, signal, entry }) {
+  if (userQuestions === undefined || typeof userQuestions.askTimed !== 'function') return 'unavailable'
+  if (agent === undefined || callId === undefined) return 'unavailable'
+  const question = {
+    id: 'keymanager-overwrite',
+    header: '覆盖凭据确认',
+    question: `要覆盖凭据「${entry.name}」吗？原有密钥将被替换，且无法恢复。`,
+    detail: entry.notes.length > 0 ? `凭据备注：${dialogPurpose(entry.notes)}` : '这条凭据没有备注。',
+    options: [
+      { label: OVERWRITE_LABEL, description: '用新值替换原有密钥。' },
+      { label: CANCEL_LABEL, description: '保留原有密钥，什么都不改。' },
+    ],
+  }
+  let result
+  try {
+    result = await userQuestions.askTimed(
+      { agent, questions: [question], ...(signal === undefined ? {} : { signal }) },
+      callId,
+      APPROVAL_TIMEOUT_MS,
+    )
+  } catch {
+    return 'unavailable'
+  }
+  if (result === undefined || result === null) return 'unavailable'
+  if (result.pending === true) return 'timeout'
+  const selected = result.answers?.[0]?.selected?.[0] ?? ''
+  return selected === OVERWRITE_LABEL ? 'allowed' : 'denied'
 }
 
 /** Session-aware facade over the vault. Grants live in process memory only. */
@@ -184,9 +233,9 @@ class KeyManager {
     const listed = await this.#vault.list()
     const byId = listed.find((entry) => entry.id === reference)
     if (byId !== undefined) return byId
-    const known = listed.map((entry) => entry.name)
-    const suffix = known.length === 0 ? '保险库为空' : `已知名称：${known.join('、')}`
-    throw new VaultError(`找不到名为「${name}」的凭据（${suffix}）`, 'NOT_FOUND')
+    // Do not enumerate the vault here: the error goes to the model, and the
+    // listing tool is the one place names are meant to be disclosed.
+    throw new VaultError(`找不到名为「${name}」的凭据；可用 credential_list 查看现有名称。`, 'NOT_FOUND')
   }
 
   /** Whether this conversation may read the entry right now. */
@@ -232,9 +281,16 @@ const KIND_LABELS = {
   note: '备注',
 }
 
+/** Mask a secret for model-facing card text; the value itself stays in the result. */
+function maskSecret(secret) {
+  const value = typeof secret === 'string' ? secret : ''
+  if (value.length <= 8) return '（已隐藏）'
+  return `${value.slice(0, 4)}…${value.slice(-4)}`
+}
+
 /** Compact model-facing summary of a vault listing. */
 function renderListing(value) {
-  const lines = [`保险库：${value.storage.vaultPath}（${value.storage.algorithm}）`]
+  const lines = [`保险库（${value.storage.algorithm}），密钥与主密钥都只留在本机。`]
   lines.push(`本对话：${value.sessionId ?? '无'} · 可读 ${value.availableCount}/${value.entries.length}`)
   if (value.entries.length === 0) {
     lines.push('尚无任何凭据')
@@ -301,9 +357,14 @@ export function apply(ctx, config = {}) {
   const vault = new KeyVault({
     dir: dataDir,
     keyEnv: typeof config?.keyEnv === 'string' && config.keyEnv.length > 0 ? config.keyEnv : undefined,
+    allowKeyFile: config?.keyFile !== 'never',
   })
   const manager = new KeyManager(vault)
   const diag = createDiagnostics(dataDir)
+  /** Last in-conversation approval request per (session, entry). */
+  const lastAsk = new Map()
+  /** Timestamps of client-driven grant writes, for a crude rate limit. */
+  const grantWrites = []
 
   const sessionOf = (exec) => {
     const id = exec?.agent?.id ?? exec?.agent?.session?.id
@@ -321,8 +382,17 @@ export function apply(ctx, config = {}) {
         return manager.update(input)
       case 'remove':
         return manager.remove(input.id)
-      case 'grant':
-        return manager.setGrant(input.sessionId, input.id, input.enabled !== false)
+      case 'grant': {
+        // Same-origin scripts are the operator on this host, but a runaway
+        // page must not be able to open grants for hundreds of sessions.
+        const now = Date.now()
+        while (grantWrites.length > 0 && now - grantWrites[0] > 60_000) grantWrites.shift()
+        if (grantWrites.length >= 30) throw new VaultError('授权写入过于频繁，请稍后再试。', 'TOO_MANY_REQUESTS')
+        grantWrites.push(now)
+        const result = await manager.setGrant(input.sessionId, input.id, input.enabled !== false)
+        diag(`grant session=${String(input.sessionId ?? '').slice(0, 64)} id=${String(input.id ?? '').slice(0, 64)} enabled=${result.enabled}`)
+        return result
+      }
       case 'usage':
         return vault.usage(typeof input.limit === 'number' ? input.limit : 50)
       default:
@@ -346,11 +416,7 @@ export function apply(ctx, config = {}) {
                 type: 'object',
                 additionalProperties: true,
                 properties: {
-                  vaultPath: { type: 'string' },
-                  dataDir: { type: 'string' },
                   algorithm: { type: 'string' },
-                  keySource: { type: 'string' },
-                  keyPath: { type: 'string' },
                 },
               },
               sessionId: { type: 'string' },
@@ -364,10 +430,12 @@ export function apply(ctx, config = {}) {
         async execute(_args, exec) {
           const value = await manager.describe(sessionOf(exec))
           // The tool output schema is strings only: fold absent values into ''.
+          // File paths stay out of model-visible output on purpose: they would
+          // hand the model the exact location of the vault and its master key.
           return {
             ...value,
             sessionId: value.sessionId ?? '',
-            storage: { ...value.storage, keyPath: value.storage.keyPath ?? '' },
+            storage: { algorithm: value.storage.algorithm },
             entries: value.entries.map((entry) => ({ ...entry, lastUsedAt: entry.lastUsedAt ?? '' })),
           }
         },
@@ -407,21 +475,36 @@ export function apply(ctx, config = {}) {
             },
           },
           render: (_args, value) => {
+            // The card text is persisted by the harness, so it shows a mask;
+            // the complete value travels in the tool result only.
             const lines = []
             const account = value.username.length > 0 ? `（用户名：${value.username}）` : ''
-            lines.push(`凭据「${value.name}」${account}的密钥：`)
-            lines.push(value.secret)
+            lines.push(`凭据「${value.name}」${account}的密钥（已掩码，完整值见工具结果）：`)
+            lines.push(maskSecret(value.secret))
             if (value.notes.length > 0) lines.push(`备注：${value.notes}`)
             return [{ type: 'text', text: lines.join('\n') }]
           },
         },
         async execute(args, exec) {
           const name = typeof args?.name === 'string' ? args.name : ''
-          const purpose = typeof args?.purpose === 'string' ? args.purpose : ''
+          const purpose = dialogPurpose(typeof args?.purpose === 'string' ? args.purpose : '')
           if (name.length === 0) throw new Error('缺少 name')
           const sessionId = sessionOf(exec)
           const found = await manager.locate(name)
           if (!manager.mayRead(found, sessionId)) {
+            // Back off repeated asks for the same entry: a looping agent must
+            // not be able to drown the user in approval dialogs.
+            const askKey = `${sessionId ?? '-'}\u0000${found.id}`
+            const now = Date.now()
+            const last = lastAsk.get(askKey)
+            if (last !== undefined && now - last < REQUEST_COOLDOWN_MS) {
+              const wait = Math.ceil((REQUEST_COOLDOWN_MS - (now - last)) / 1000)
+              throw new VaultError(
+                `刚刚已经向用户申请过凭据「${found.name}」，请等待 ${wait} 秒后再试；也可以让用户在输入框旁的钥匙面板里直接打开它。`,
+                'ACCESS_DENIED',
+              )
+            }
+            lastAsk.set(askKey, now)
             const outcome = await requestAccess({
               userQuestions: ctx.get('userQuestions'),
               agent: exec.agent,
@@ -472,7 +555,7 @@ export function apply(ctx, config = {}) {
       ctx.tools.register({
         name: `${TOOL_PREFIX}_save`,
         description:
-          '把登录凭据、令牌或备注存入用户的本地加密凭据库，供以后的对话使用。不会读回已有密钥。覆盖用户已命名的条目必须显式传 overwrite=true，覆盖前先征得用户同意。',
+          '把登录凭据、令牌或备注存入用户的本地加密凭据库，供以后的对话使用。不会读回已有密钥。覆盖用户已命名的条目必须显式传 overwrite=true，插件会再向用户弹一次确认，用户同意后才替换。',
         parameters: {
           type: 'object',
           additionalProperties: false,
@@ -488,11 +571,7 @@ export function apply(ctx, config = {}) {
             username: { type: 'string', description: '账号名或邮箱（这条凭据有的话）。' },
             notes: { type: 'string', description: '用在哪里，或使用它需要知道什么。' },
             tags: { type: 'array', items: { type: 'string' }, description: '可选标签。' },
-            autoGrant: {
-              type: 'boolean',
-              description: '让它在所有对话里都可读，省去每个对话单独开关。默认 false。',
-            },
-            overwrite: { type: 'boolean', description: '覆盖同名条目。' },
+            overwrite: { type: 'boolean', description: '覆盖同名条目；会再向用户确认一次。' },
           },
         },
         output: {
@@ -517,10 +596,36 @@ export function apply(ctx, config = {}) {
         async execute(args, exec) {
           if (typeof args?.name !== 'string' || args.name.trim().length === 0) throw new Error('缺少 name')
           if (typeof args?.secret !== 'string' || args.secret.length === 0) throw new Error('缺少 secret')
-          const existed = (await vault.findByName(args.name)) !== undefined
-          const saved = await manager.save({ ...args, overwrite: args.overwrite === true })
+          const existing = await vault.findByName(args.name)
+          const overwrite = args.overwrite === true
+          if (existing !== undefined && overwrite) {
+            const outcome = await confirmOverwrite({
+              userQuestions: ctx.get('userQuestions'),
+              agent: exec.agent,
+              callId: exec.callId,
+              signal: exec.signal,
+              entry: existing,
+            })
+            if (outcome !== 'allowed') {
+              if (outcome === 'denied') {
+                throw new VaultError(`用户没有确认覆盖凭据「${existing.name}」，原有密钥保持不变。`, 'ACCESS_DENIED')
+              }
+              if (outcome === 'timeout') {
+                throw new VaultError(
+                  `等待用户确认覆盖超时（${APPROVAL_TIMEOUT_MS / 1000} 秒），原有密钥保持不变。`,
+                  'ACCESS_TIMEOUT',
+                )
+              }
+              throw new VaultError(
+                `当前环境无法弹出覆盖确认，请让用户在「设置 > 凭据」里修改凭据「${existing.name}」。`,
+                'NOT_AVAILABLE',
+              )
+            }
+          }
+          const existed = existing !== undefined
+          const saved = await manager.save({ ...args, overwrite })
           const sessionId = sessionOf(exec)
-          if (!existed && args.autoGrant !== true && typeof sessionId === 'string') {
+          if (!existed && typeof sessionId === 'string') {
             // The conversation that stored it can read it back immediately.
             await manager.setGrant(sessionId, saved.id, true)
           }
