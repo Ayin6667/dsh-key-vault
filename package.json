@@ -4,6 +4,11 @@
   "private": true,
   "type": "module",
   "description": "Encrypted local credential vault for DSH agents: per-conversation access switches, agent tools, and a read log.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Ayin6667/dsh-key-vault"
+  },
   "icon": "./icon.svg",
   "exports": {
     ".": "./main.js",
