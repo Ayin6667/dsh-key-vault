@@ -31,11 +31,19 @@ export class VaultError extends Error {
   }
 }
 
+/** Control characters and bidi overrides that can disguise text in a dialog. */
+const UNSAFE_CHARS = /[\u0000-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069]/g
+
+/** Strip control and bidirectional-override characters from one input string. */
+export function stripUnsafe(value) {
+  return typeof value === 'string' ? value.replace(UNSAFE_CHARS, '') : ''
+}
+
 /** Trim and bound one optional text field. */
 function text(value, max, label) {
   if (value === undefined || value === null) return ''
   if (typeof value !== 'string') throw new VaultError(`${label}必须是字符串`, 'BAD_INPUT')
-  const trimmed = value.trim()
+  const trimmed = stripUnsafe(value).trim()
   if (trimmed.length > max) throw new VaultError(`${label}不能超过 ${max} 个字符`, 'BAD_INPUT')
   return trimmed
 }
@@ -149,14 +157,16 @@ export class KeyVault {
   #dir
   #keyEnv
   #envKey
+  #allowKeyFile
   #key = null
   #state = null
   #ready = null
   #queue = Promise.resolve()
 
-  constructor({ dir, keyEnv = 'DSH_KEYMANAGER_KEY' }) {
+  constructor({ dir, keyEnv = 'DSH_KEYMANAGER_KEY', allowKeyFile = true }) {
     this.#dir = dir
     this.#keyEnv = keyEnv
+    this.#allowKeyFile = allowKeyFile
   }
 
   get vaultPath() {
@@ -181,6 +191,7 @@ export class KeyVault {
       vaultPath: this.vaultPath,
       keyPath: this.#envKey === undefined ? this.keyPath : null,
       keySource: this.#envKey === undefined ? 'key-file' : `env:${this.#keyEnv}`,
+      keyPolicy: this.#allowKeyFile ? 'file-allowed' : 'env-only',
       keyEnv: this.#keyEnv,
       algorithm: ALGORITHM,
       format: FORMAT,
@@ -209,6 +220,15 @@ export class KeyVault {
     } catch (error) {
       if (error instanceof VaultError) throw error
       if (error?.code !== 'ENOENT') throw error
+    }
+    if (!this.#allowKeyFile) {
+      // The strongest available boundary: no key material on disk at all, so
+      // neither this plugin nor any process running as the same user can
+      // decrypt the vault just by reading its directory.
+      throw new VaultError(
+        `没有可用的主密钥：请把 64 位十六进制主密钥放进环境变量 ${this.#keyEnv}（当前配置为 keyFile: never，插件不会把主密钥写到磁盘）`,
+        'NO_KEY',
+      )
     }
     const created = randomBytes(KEY_BYTES)
     await this.#atomicWrite(this.keyPath, created, 0o600)
