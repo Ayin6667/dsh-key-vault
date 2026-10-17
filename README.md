@@ -161,3 +161,7 @@ plugin_manager remove_bundle    target = dsh-key-vault
 - 审计最多保留最近 500 条。
 - 只有「读密钥」一种消费方式；把密钥注入子进程环境而不让模型看到（`credential_exec`）是后续可加的能力。
 - **升级插件后要重启应用**：Node 按模块 URL 缓存 ESM，同一进程内重装同名包不会加载新代码。改完代码请重启 DSH Desktop；开发期用新包名重装可以立刻生效（本插件就是这样迭代的）。
+
+## 许可证
+
+MIT，见 [`LICENSE`](LICENSE)。本插件为原创实现、无第三方依赖；DSH 宿主与装载器同样以 MIT 发布，本插件不改变其许可。
