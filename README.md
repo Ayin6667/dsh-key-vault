@@ -112,8 +112,7 @@ plugin_manager remove_bundle    target = dsh-key-vault
 ### 加密
 
 - AES-256-GCM，每条目独立 12 字节 IV，AAD 绑定条目 id（密文不能在条目之间调换）。
-- 主密钥 32 字节随机数，默认在保险库旁 `vault.key`（写入时尝试 `0600`）。
-- 也可以用环境变量：行配置 `keyEnv`（默认 `DSH_KEYMANAGER_KEY`），值为 64 位十六进制或 32 字节 base64；设置后不再读 `vault.key`。
+- 主密钥 32 字节随机数。两种来源：环境变量（`keyEnv`，默认 `DSH_KEYMANAGER_KEY`，值为 64 位十六进制或 32 字节 base64），或保险库旁的 `vault.key`（`0600` 尽力而为）。
 - 写盘走「临时文件 + rename」原子替换，`vault.json` 只含密文、IV、认证标签与非敏感元数据（名称、类型、标签、时间、使用次数、审计）。
 
 ### 数据位置
@@ -125,16 +124,40 @@ plugin_manager remove_bundle    target = dsh-key-vault
   config:
     dataDir: 'D:\somewhere\keymanager'
     keyEnv: 'DSH_KEYMANAGER_KEY'
+    keyFile: never          # 可选：env-only，禁止把主密钥写到磁盘
 ```
 
-### 边界（如实理解）
+### 边界（如实理解，这决定了它适合什么场景）
 
-- 主密钥与密文默认同目录：挡的是**误传播**（单独拷走 `vault.json`、同步网盘、贴进日志都读不出内容），**不挡**拿到整个用户目录的攻击者。要更强隔离，把主密钥搬进系统密钥库并用 `keyEnv` 注入。
+**真实边界是「同一 Windows 用户」，不是「同一对话」。** 授权面板与钥匙开关在威胁模型里只约束「模型老实走工具」，对同用户进程无效：
+
+- 主密钥与密文默认同目录、同 ACL。任何以你的身份运行的进程（首当其冲是 Agent 自己的 shell 工具）读走这两个文件即可离线解密全部凭据，授权表对它完全不起作用。
+- 想真正隔离，把主密钥放进系统密钥库（Windows Credential Manager / DPAPI 保护的文件均可），用启动环境注入，并设 `keyFile: never`——此时插件拒绝在磁盘上生成主密钥，没有环境变量就直接报 `NO_KEY`，宁可不工作也不降级。
+- 工具输出不回传任何文件路径（只剩算法名）；路径只在设置页给你看。
+- `credential_reveal` 的卡片文本改为掩码，但**完整密钥仍在工具结果里**，并随会话记录、记忆日志（明文 JSONL）落盘，事后不可撤回——这是「把密钥交给模型」的固有代价，不是插件能消除的。
+- 覆盖同一条目要用户二次确认（`autoGrant` 已从工具参数移除，只有设置页能开「所有对话可读」）。
+- 授权对话框里，用途文本先清洗控制字符与双向覆盖字符、截到 120 字，并以凭据自身备注为主、模型自述为辅。
+- 同一对话对同一凭据的申请有 60 秒退避；同源页面写授权的频率也有限制，每一次授权写入都记进 `rpc.log`（权限 `0600` 尽力而为）。
+- 「同源即操作员」是宿主自己的边界：任何同源客户端脚本都能替会话写授权，这是平台性质，插件只做限流与留痕。
 - Windows 下 POSIX 权限位无效，`0600` 是尽力而为；实际保护来自用户目录 ACL。
-- 授权是「对话级」而非「每次调用」：开关打开后本对话可多次读取，直到重启或关闭开关。
+- 授权是「对话级」而非「每次调用」，且在应用重启前不过期。
+- 明文元数据与审计：`vault.json` 里的名称、类型、标签、时间、`purpose`、会话 id 未加密——没有主密钥也能读出「有哪些凭据、什么时候被用过、做了什么」，这是我们选择的可审计性，不是加密承诺的一部分。
 - 审计与密文同文件，属于防篡改（改文件会破坏 GCM 校验），不是防删除。
-- Agent 读到的密钥进入会话日志，而会话日志是明文 JSONL——Harness 的性质，插件无法改变。
+- 子 Agent（被父会话拥有的 child）是独立会话 id，读不到父会话的授权；这是 fail-closed，不是漏洞。
 - 宿主半把 `webServer` 与 `connection` 声明为硬依赖：没有它们的 profile（例如纯 CLI）里整个插件不激活，工具也不会出现。
+
+### 审查结论与处置（2026-10-17）
+
+| 级别 | 问题 | 处置 |
+| --- | --- | --- |
+| 高 | 主密钥与密文同目录、同用户可读 | 未改默认（兼容已有库），新增 `keyFile: never` 与文档边界；推荐 env + 系统密钥库 |
+| 高 | `credential_list` 把主密钥路径交给模型 | 已修：工具输出只留算法名，`render` 去掉路径行 |
+| 中高 | `reveal` 明文被持久化到会话/记忆日志 | 已缓解：卡片文本掩码；完整值仍随工具结果落盘（文档写明） |
+| 中高 | `autoGrant` / `overwrite` 由模型自选 | 已修：`autoGrant` 移出工具参数；`overwrite` 走二次确认 |
+| 中 | 授权对话框内容与长度由模型控制 | 已修：控制字符与 bidi 清洗、120 字上限、备注优先 |
+| 中 | 同源脚本可无手势写授权；同意无频率限制 | 已缓解：60 秒退避、授权写入限流、审计留痕（同源=操作员属平台边界） |
+| 低 | 明文元数据/审计、`rpc.log` 权限、错误回显名册 | 已修：`rpc.log` 用 `0600` 创建；`locate` 不再枚举名称；明文元数据已在文档写明 |
+| 低 | 授权无过期、审计写入绕开队列、密钥不 zeroize、子 Agent 无授权 | 保留并在上文写明（fail-closed 行为） |
 
 ### 密钥丢失 / 更换
 
@@ -152,6 +175,7 @@ plugin_manager remove_bundle    target = dsh-key-vault
 6. **汉化**：宿主探针断言工具描述、参数说明与 `render` 文本为中文（`description-zh`、`render-zh-empty`、`render-zh-save` 全为 true），报错同样为中文（`未对本对话开放`、`找不到名为…`）；界面侧 `locked` 徽标、网络与协议错误也走中文词典。`locale-probe.mjs` 静态核对在用的 63 个文案键在 en / zh 两份词典（各 67 键）中均存在且键集一致。
 7. **对话内授权**（`test/host-probe.mjs`，伪 `userQuestions`）：拒绝 → `ACCESS_DENIED`（确认卡片的问题文本含凭据名、超时值大于 0）；批准 → 返回正确密钥，且同一对话第二次读取不再弹窗（`asked` 计数不变）；无人作答 → `ACCESS_TIMEOUT`；无该服务 → 回落 `NOT_AVAILABLE`。
 8. **安装**：`install_bundle` 返回 `application: applied`、无 warning。
+9. **安全加固**（`test/host-probe.mjs`、`test/vault-probe.mjs`）：`reveal-masked`（卡片不含明文、含「已掩码」）、`list-hides-paths`（输出无 `keyPath` / `vaultPath`，只剩 `algorithm`）、`save-no-autogrant`（工具参数已无 `autoGrant`）、`overwrite-denied` / `overwrite-confirmed` / `overwrite-applied`（拒绝则原值不变、同意才替换）、`approval-cooldown`（60 秒内重复申请不再弹窗）、`grant-rate-limit`（第 31 次授权写入返回 `TOO_MANY_REQUESTS`）、`sanitize-name` / `purpose-clamped`（bidi 与控制字符被剥离、用途截到 120 字）、`no-key-file`（`keyFile: never` + 无环境变量 → `NO_KEY` 且不写 `vault.key`）、`unknown-name`（错误不再枚举名称）。
 
 ## 已知限制
 
