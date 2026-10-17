@@ -407,26 +407,30 @@ export class KeyVault {
   }
 
   /**
-   * Decrypt one entry and record the read.
+   * Decrypt one entry and record the read. The audit write shares the vault's
+   * mutation queue, so a read never interleaves with a create/update/remove.
    * @returns the plaintext plus the entry view.
    */
   async reveal(id, { sessionId, purpose, callId } = {}) {
-    await this.ready()
-    const entry = this.#find(id)
-    const secret = open(this.#key, entry.id, entry.secret)
-    entry.lastUsedAt = new Date().toISOString()
-    entry.useCount = (entry.useCount ?? 0) + 1
-    this.#state.usage.push({
-      at: entry.lastUsedAt,
-      entryId: entry.id,
-      entryName: entry.name,
-      sessionId: typeof sessionId === 'string' ? sessionId : null,
-      purpose: text(purpose, 200, 'purpose'),
-      callId: typeof callId === 'string' ? callId : null,
+    let secret
+    let view
+    await this.#mutate(async () => {
+      const entry = this.#find(id)
+      secret = open(this.#key, entry.id, entry.secret)
+      entry.lastUsedAt = new Date().toISOString()
+      entry.useCount = (entry.useCount ?? 0) + 1
+      this.#state.usage.push({
+        at: entry.lastUsedAt,
+        entryId: entry.id,
+        entryName: entry.name,
+        sessionId: typeof sessionId === 'string' ? sessionId : null,
+        purpose: text(purpose, 200, 'purpose'),
+        callId: typeof callId === 'string' ? callId : null,
+      })
+      if (this.#state.usage.length > MAX_USAGE) this.#state.usage = this.#state.usage.slice(-MAX_USAGE)
+      view = entryView(entry, this.#meta(entry))
     })
-    if (this.#state.usage.length > MAX_USAGE) this.#state.usage = this.#state.usage.slice(-MAX_USAGE)
-    await this.#save()
-    return { entry: entryView(entry, this.#meta(entry)), secret }
+    return { entry: view, secret }
   }
 
   /** Recent reads, newest first. */
