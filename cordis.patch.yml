@@ -1,0 +1,5 @@
+# Key manager bundle: one Host row; the Client half ships as `./client`.
+- insert:
+    - id: keymanager
+      name: 'dsh-key-vault'
+      config: {}

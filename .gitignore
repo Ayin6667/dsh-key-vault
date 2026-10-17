@@ -1,0 +1,8 @@
+# 依赖与本地产物
+node_modules/
+*.log
+*.tmp
+.DS_Store
+
+# 探针输出
+test/*.out.txt

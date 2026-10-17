@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Credentials",
+    "description": "Encrypted local vault of login credentials the agent can read in the conversations you allow, with a log of every read."
+  }
+}

@@ -1,0 +1,33 @@
+{
+  "name": "dsh-key-vault",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Encrypted local credential vault for DSH agents: per-conversation access switches, agent tools, and a read log.",
+  "icon": "./icon.svg",
+  "exports": {
+    ".": "./main.js",
+    "./client": "./client.js",
+    "./package.json": "./package.json",
+    "./locale/*.json": "./locale/*.json"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": ["@deepseek-ai/dsh-client-locale", "@deepseek-ai/dsh-client-ui-settings"]
+    }
+  },
+  "files": [
+    "main.js",
+    "client.js",
+    "core.js",
+    "cordis.patch.yml",
+    "locale",
+    "icon.svg",
+    "README.md"
+  ]
+}
