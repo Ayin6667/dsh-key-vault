@@ -1,5 +1,5 @@
 // Vault round-trip probe: crypto, persistence, audit, and a wrong-key run.
-import { mkdtempSync, readFileSync, writeFileSync, mkdirSync, copyFileSync } from 'node:fs'
+import { mkdtempSync, readFileSync, writeFileSync, mkdirSync, copyFileSync, existsSync } from 'node:fs'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { KeyVault } from '../core.js'
@@ -72,5 +72,17 @@ log('removed', removed.name === 'example.com', (await vault.list()).length === 0
 // The key file holds exactly 32 bytes.
 const keyBytes = readFileSync(join(dir, 'vault.key'))
 log('key-file', keyBytes.length === 32)
+
+// keyFile: never refuses to put key material on disk at all.
+const envOnlyDir = mkdtempSync(join(tmpdir(), 'dkm-envonly-'))
+delete process.env.DKM_TEST_KEY
+const envOnly = new KeyVault({ dir: envOnlyDir, keyEnv: 'DKM_TEST_KEY', allowKeyFile: false })
+let noKey = 'none'
+try {
+  await envOnly.list()
+} catch (error) {
+  noKey = error.code
+}
+log('no-key-file', noKey === 'NO_KEY', existsSync(join(envOnlyDir, 'vault.key')) === false)
 
 writeFileSync(process.env.PROBE_OUT ?? 'vault-probe.txt', out.join('\n') + '\n')
