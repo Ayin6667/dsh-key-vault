@@ -17,15 +17,17 @@
   cordis.patch.yml      插入一行 id: keymanager
   main.js               宿主半：会话授权、三个工具、POST /keymanager/rpc
   core.js               保险库：AES-256-GCM 封装、原子写盘、审计
+  get-secret.mjs        本地脚本用：从保险库取一条密钥（省掉脚本自己的明文副本）
   client.js             浏览器半：钥匙药丸 + 浮层面板 + 设置页
   locale/en.json        插件卡片标题与描述（英文）
   locale/zh.json        同上（中文）
   icon.svg              插件图标
   README.md             本文件
   test/
-    vault-probe.mjs     保险库加密 / 持久化 / 错误路径
+    vault-probe.mjs     保险库加密 / 持久化 / 错误路径 / 并发审计
     host-probe.mjs      宿主半：三个工具 + HTTP 端点 + 鉴权门 + 输出 schema 校验
     client-probe.mjs    浏览器半：模块加载、槽位注册、样式与中英文渲染
+    cli-probe.mjs       get-secret.mjs：取值、字段选择、失败退出码、审计落盘
 ```
 
 ## 安装与卸载
@@ -134,7 +136,8 @@ plugin_manager remove_bundle    target = dsh-key-vault
 - 主密钥与密文默认同目录、同 ACL。任何以你的身份运行的进程（首当其冲是 Agent 自己的 shell 工具）读走这两个文件即可离线解密全部凭据，授权表对它完全不起作用。
 - 想真正隔离，把主密钥放进系统密钥库（Windows Credential Manager / DPAPI 保护的文件均可），用启动环境注入，并设 `keyFile: never`——此时插件拒绝在磁盘上生成主密钥，没有环境变量就直接报 `NO_KEY`，宁可不工作也不降级。
 - 工具输出不回传任何文件路径（只剩算法名）；路径只在设置页给你看。
-- `credential_reveal` 的卡片文本改为掩码，但**完整密钥仍在工具结果里**，并随会话记录、记忆日志（明文 JSONL）落盘，事后不可撤回——这是「把密钥交给模型」的固有代价，不是插件能消除的。
+- 未开放的条目在 `credential_list` 里**只给名称**：备注、账号、以及别的会话的读取记录（`usage` 行含 `purpose` 与会话 id）都按本对话可见范围过滤。
+- `credential_reveal` 的卡片文本改为掩码，但**完整密钥仍在工具结果里**。2026-10-17 的复核没有在会话存档（zstd）与记忆日志里找到明文，所以「必定落盘」的说法不成立；但工具结果如何存档由 Harness 决定、不由插件控制，请按「会给模型看到」来处置。
 - 覆盖同一条目要用户二次确认（`autoGrant` 已从工具参数移除，只有设置页能开「所有对话可读」）。
 - 授权对话框里，用途文本先清洗控制字符与双向覆盖字符、截到 120 字，并以凭据自身备注为主、模型自述为辅。
 - 同一对话对同一凭据的申请有 60 秒退避；同源页面写授权的频率也有限制，每一次授权写入都记进 `rpc.log`（权限 `0600` 尽力而为）。
@@ -146,19 +149,36 @@ plugin_manager remove_bundle    target = dsh-key-vault
 - 子 Agent（被父会话拥有的 child）是独立会话 id，读不到父会话的授权；这是 fail-closed，不是漏洞。
 - 宿主半把 `webServer` 与 `connection` 声明为硬依赖：没有它们的 profile（例如纯 CLI）里整个插件不激活，工具也不会出现。
 
+### 保险库之外的明文副本（最需要优先处理的一条，2026-10-17 复核）
+
+实测：`~/.dsh/secrets/hsr-github-token` 与 `~/.dsh/secrets/cloudflare.json` 里各有一份**与保险库明文同哈希**的副本。也就是说实际使用链路（月历推送脚本、`deploy_cf.py`）读的是这些明文文件，保险库只是旁挂的第二份。
+
+这类副本不归插件管，但插件能提供替代路径：把脚本改成从保险库取密钥，副本就没有存在必要了。
+
+```python
+import subprocess
+token = subprocess.check_output(
+    ['node', r'<插件目录>\get-secret.mjs', 'github.com'], text=True
+).strip()
+```
+
+`get-secret.mjs` 只把密钥写到 stdout，失败时非零退出；每次取值都会进 `usage` 审计（`purpose` 记为 `get-secret.mjs`）。支持 `--field secret|username|notes`、`--data-dir`、`--key-env`。
+
 ### 审查结论与处置（2026-10-17）
 
 | 级别 | 问题 | 处置 |
 | --- | --- | --- |
 | 高 | 主密钥与密文同目录、同用户可读 | 未改默认（兼容已有库），新增 `keyFile: never` 与文档边界；推荐 env + 系统密钥库 |
-| 高 | `credential_list` 把主密钥路径交给模型 | 已修：工具输出只留算法名，`render` 去掉路径行 |
-| 中高 | `reveal` 明文被持久化到会话/记忆日志 | 已缓解：卡片文本掩码；完整值仍随工具结果落盘（文档写明） |
+| 高 | `credential_list` 把主密钥路径交给模型 | 已修：工具输出只留算法名，`render` 去掉路径行（第二轮复核仍看到路径，是因为宿主还在跑改动前的模块——重启后复验） |
+| 中高 | `reveal` 明文被持久化到会话/记忆日志 | **第二轮已撤回**：56 个文件全解码、零命中，阳性对照同样零命中 → 会话存档不保存工具输出。改为：卡片掩码 + 文档说明「工具结果由 Harness 决定如何存档」 |
 | 中高 | `autoGrant` / `overwrite` 由模型自选 | 已修：`autoGrant` 移出工具参数；`overwrite` 走二次确认 |
 | 中 | 授权对话框内容与长度由模型控制 | 已修：控制字符与 bidi 清洗、120 字上限、备注优先 |
 | 中 | 同源脚本可无手势写授权；同意无频率限制 | 已缓解：60 秒退避、授权写入限流、审计留痕（同源=操作员属平台边界） |
-| 低 | 明文元数据/审计、`rpc.log` 权限、错误回显名册 | 已修：`rpc.log` 用 `0600` 创建；`locate` 不再枚举名称；明文元数据已在文档写明 |
+| 中 | 未开放条目的备注/账号/审计对外可见 | 已修：`credential_list` 对未开放条目隐藏 `notes` / `username` / 跨会话 `usage`，并标 `redacted` |
+| 低 | `rpc.log` 权限、错误回显名册 | 已修：`rpc.log` 用 `0600` 创建；`locate` 不再枚举名称 |
 | 低 | 审计写入绕开队列 | 已修：`reveal()` 走 `#mutate` 队列，并发读不再丢审计行（`concurrent-audit` 断言） |
 | 低 | 授权无过期、密钥不 zeroize、子 Agent 无授权 | 保留并在上文写明（子 Agent 无授权是 fail-closed 行为） |
+| — | 保险库外的明文副本 | 插件侧提供 `get-secret.mjs`；脚本改造需要用户侧动手 |
 
 ### 密钥丢失 / 更换
 
@@ -176,7 +196,7 @@ plugin_manager remove_bundle    target = dsh-key-vault
 6. **汉化**：宿主探针断言工具描述、参数说明与 `render` 文本为中文（`description-zh`、`render-zh-empty`、`render-zh-save` 全为 true），报错同样为中文（`未对本对话开放`、`找不到名为…`）；界面侧 `locked` 徽标、网络与协议错误也走中文词典。`locale-probe.mjs` 静态核对在用的 63 个文案键在 en / zh 两份词典（各 67 键）中均存在且键集一致。
 7. **对话内授权**（`test/host-probe.mjs`，伪 `userQuestions`）：拒绝 → `ACCESS_DENIED`（确认卡片的问题文本含凭据名、超时值大于 0）；批准 → 返回正确密钥，且同一对话第二次读取不再弹窗（`asked` 计数不变）；无人作答 → `ACCESS_TIMEOUT`；无该服务 → 回落 `NOT_AVAILABLE`。
 8. **安装**：`install_bundle` 返回 `application: applied`、无 warning。
-9. **安全加固**（`test/host-probe.mjs`、`test/vault-probe.mjs`）：`reveal-masked`（卡片不含明文、含「已掩码」）、`list-hides-paths`（输出无 `keyPath` / `vaultPath`，只剩 `algorithm`）、`save-no-autogrant`（工具参数已无 `autoGrant`）、`overwrite-denied` / `overwrite-confirmed` / `overwrite-applied`（拒绝则原值不变、同意才替换）、`approval-cooldown`（60 秒内重复申请不再弹窗）、`grant-rate-limit`（第 31 次授权写入返回 `TOO_MANY_REQUESTS`）、`sanitize-name` / `purpose-clamped`（bidi 与控制字符被剥离、用途截到 120 字）、`no-key-file`（`keyFile: never` + 无环境变量 → `NO_KEY` 且不写 `vault.key`）、`unknown-name`（错误不再枚举名称）、`concurrent-audit`（5 个并发读取的审计行一条不丢）。
+10. **旁路与元数据**（`test/host-probe.mjs`、`test/cli-probe.mjs`）：`list-redacted`（未开放条目的 `notes` / `username` 为空、`redacted=true`、跨会话 `usage` 为空）、`render-redacted`（渲染文本含「已隐藏」且不含备注原文）；`get-secret.mjs` 的取值 / 字段选择 / 未知名称非零退出 / 每次读取入审计（`cli-secret`、`cli-username`、`cli-notes`、`cli-missing`、`cli-audited` 全为 true）。
 
 ## 已知限制
 
