@@ -157,7 +157,8 @@ plugin_manager remove_bundle    target = dsh-key-vault
 | 中 | 授权对话框内容与长度由模型控制 | 已修：控制字符与 bidi 清洗、120 字上限、备注优先 |
 | 中 | 同源脚本可无手势写授权；同意无频率限制 | 已缓解：60 秒退避、授权写入限流、审计留痕（同源=操作员属平台边界） |
 | 低 | 明文元数据/审计、`rpc.log` 权限、错误回显名册 | 已修：`rpc.log` 用 `0600` 创建；`locate` 不再枚举名称；明文元数据已在文档写明 |
-| 低 | 授权无过期、审计写入绕开队列、密钥不 zeroize、子 Agent 无授权 | 保留并在上文写明（fail-closed 行为） |
+| 低 | 审计写入绕开队列 | 已修：`reveal()` 走 `#mutate` 队列，并发读不再丢审计行（`concurrent-audit` 断言） |
+| 低 | 授权无过期、密钥不 zeroize、子 Agent 无授权 | 保留并在上文写明（子 Agent 无授权是 fail-closed 行为） |
 
 ### 密钥丢失 / 更换
 
@@ -175,7 +176,7 @@ plugin_manager remove_bundle    target = dsh-key-vault
 6. **汉化**：宿主探针断言工具描述、参数说明与 `render` 文本为中文（`description-zh`、`render-zh-empty`、`render-zh-save` 全为 true），报错同样为中文（`未对本对话开放`、`找不到名为…`）；界面侧 `locked` 徽标、网络与协议错误也走中文词典。`locale-probe.mjs` 静态核对在用的 63 个文案键在 en / zh 两份词典（各 67 键）中均存在且键集一致。
 7. **对话内授权**（`test/host-probe.mjs`，伪 `userQuestions`）：拒绝 → `ACCESS_DENIED`（确认卡片的问题文本含凭据名、超时值大于 0）；批准 → 返回正确密钥，且同一对话第二次读取不再弹窗（`asked` 计数不变）；无人作答 → `ACCESS_TIMEOUT`；无该服务 → 回落 `NOT_AVAILABLE`。
 8. **安装**：`install_bundle` 返回 `application: applied`、无 warning。
-9. **安全加固**（`test/host-probe.mjs`、`test/vault-probe.mjs`）：`reveal-masked`（卡片不含明文、含「已掩码」）、`list-hides-paths`（输出无 `keyPath` / `vaultPath`，只剩 `algorithm`）、`save-no-autogrant`（工具参数已无 `autoGrant`）、`overwrite-denied` / `overwrite-confirmed` / `overwrite-applied`（拒绝则原值不变、同意才替换）、`approval-cooldown`（60 秒内重复申请不再弹窗）、`grant-rate-limit`（第 31 次授权写入返回 `TOO_MANY_REQUESTS`）、`sanitize-name` / `purpose-clamped`（bidi 与控制字符被剥离、用途截到 120 字）、`no-key-file`（`keyFile: never` + 无环境变量 → `NO_KEY` 且不写 `vault.key`）、`unknown-name`（错误不再枚举名称）。
+9. **安全加固**（`test/host-probe.mjs`、`test/vault-probe.mjs`）：`reveal-masked`（卡片不含明文、含「已掩码」）、`list-hides-paths`（输出无 `keyPath` / `vaultPath`，只剩 `algorithm`）、`save-no-autogrant`（工具参数已无 `autoGrant`）、`overwrite-denied` / `overwrite-confirmed` / `overwrite-applied`（拒绝则原值不变、同意才替换）、`approval-cooldown`（60 秒内重复申请不再弹窗）、`grant-rate-limit`（第 31 次授权写入返回 `TOO_MANY_REQUESTS`）、`sanitize-name` / `purpose-clamped`（bidi 与控制字符被剥离、用途截到 120 字）、`no-key-file`（`keyFile: never` + 无环境变量 → `NO_KEY` 且不写 `vault.key`）、`unknown-name`（错误不再枚举名称）、`concurrent-audit`（5 个并发读取的审计行一条不丢）。
 
 ## 已知限制
 
