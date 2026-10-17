@@ -66,6 +66,13 @@ try {
 }
 log('duplicate-name', duplicate === 'NAME_TAKEN', duplicate)
 
+// Concurrent reads share the mutation queue: every audit row survives.
+const concurrent = await Promise.all(
+  Array.from({ length: 5 }, () => vault.reveal(created.id, { purpose: 'concurrent probe' })),
+)
+const concurrentUsage = (await vault.usage(100)).filter((row) => row.purpose === 'concurrent probe')
+log('concurrent-audit', concurrent.length === 5, concurrentUsage.length === 5)
+
 const removed = await vault.remove(created.id)
 log('removed', removed.name === 'example.com', (await vault.list()).length === 0, (await vault.usage()).length === 0)
 
